@@ -1,10 +1,15 @@
 # Deacon Social patches
 
 These patches are applied on top of each upstream Mastodon stable release by
-the *Track upstream releases* workflow (`.github/workflows/upstream-sync.yml`),
-which then tags the result `vX.Y.Z-deacon.1` and dispatches the *Build images*
-workflow to publish `ghcr.io/deaconsocial/mastodon` and
-`ghcr.io/deaconsocial/mastodon-streaming` for that tag.
+the *Track upstream releases* workflow (`.github/workflows/upstream-sync.yml`).
+When a new upstream release appears, it applies `patches/`, swaps upstream's
+workflow files for the fork's own, tags the result `vX.Y.Z-deacon.1`, and
+pushes the tag over SSH using the `GH_DEPLOY_KEY` secret (a write deploy key —
+`GITHUB_TOKEN` is not allowed to push upstream's workflow-touching history).
+The tag push triggers the *Build images* workflow
+(`.github/workflows/build-image.yml`), which publishes
+`ghcr.io/deaconsocial/mastodon` and `ghcr.io/deaconsocial/mastodon-streaming`
+tagged `vX.Y.Z-deacon.1`.
 
 ## Current patches
 
@@ -21,15 +26,20 @@ longer applies to the new upstream release. To refresh it:
 git fetch upstream --tags
 git checkout --detach vX.Y.Z           # the new upstream tag
 git am --3way patches/*.patch          # fix conflicts, then: git am --continue
+
+# Mirror what the sync workflow does: fork workflows, then the tag
+git rm -r .github/workflows
+git checkout main -- .github/workflows
+git commit -m "Replace upstream workflow files with fork workflows"
 git tag vX.Y.Z-deacon.1
-git push origin vX.Y.Z-deacon.1
+git push origin vX.Y.Z-deacon.1        # this push triggers the image build
 
 # Regenerate the patch files and commit them on the default branch
-git format-patch -1 vX.Y.Z-deacon.1 -o /tmp/patches-new
+git format-patch "vX.Y.Z..vX.Y.Z-deacon.1~1" -o /tmp/patches-new
 git checkout main
-rm patches/0001-*.patch && cp /tmp/patches-new/*.patch patches/
+rm patches/*.patch && cp /tmp/patches-new/*.patch patches/
 git commit -am "Refresh patches for vX.Y.Z" && git push
 ```
 
-Then run the *Build images* workflow manually (Actions → Build images →
-Run workflow) with `ref` set to `vX.Y.Z-deacon.1`.
+(The `~1` in the `format-patch` range excludes the workflow-swap commit, which
+must not become a patch.)
