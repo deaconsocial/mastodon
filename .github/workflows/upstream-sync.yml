@@ -11,6 +11,7 @@ permissions:
 
 jobs:
   sync:
+    environment: Prod
     runs-on: ubuntu-latest
     env:
       GH_TOKEN: ${{ github.token }}
