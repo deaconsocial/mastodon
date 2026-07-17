@@ -1,0 +1,68 @@
+name: Track upstream releases
+
+on:
+  schedule:
+    - cron: "0 14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+  actions: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find newest stable upstream release
+        id: upstream
+        run: |
+          git remote add upstream https://github.com/mastodon/mastodon.git
+          git fetch upstream --tags --quiet
+          latest=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ -z "$latest" ]; then
+            echo "No stable upstream tags found" >&2
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$latest-deacon.1" >/dev/null; then
+            echo "Already patched: $latest"
+          else
+            echo "New upstream release: $latest"
+            echo "tag=$latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply patches and tag
+        if: steps.upstream.outputs.tag
+        run: |
+          tag='${{ steps.upstream.outputs.tag }}'
+          git config user.name deacon-bot
+          git config user.email bot@deacon.social
+          cp -r patches /tmp/patches
+          git checkout --detach "$tag"
+          git am --3way /tmp/patches/*.patch
+          git tag "$tag-deacon.1"
+          git push origin "$tag-deacon.1"
+
+      - name: Build images for the new tag
+        if: steps.upstream.outputs.tag
+        # The patched tag's tree does not contain build-image.yml (it is
+        # upstream code plus patches/ applied), and tags pushed with
+        # GITHUB_TOKEN don't fire push triggers anyway — so dispatch the
+        # build workflow from this branch and pass the tag as an input.
+        run: |
+          gh workflow run build-image.yml \
+            --ref '${{ github.ref_name }}' \
+            -f ref='${{ steps.upstream.outputs.tag }}-deacon.1'
+
+      - name: Open an issue if the patch no longer applies
+        if: failure() && steps.upstream.outputs.tag
+        run: |
+          gh issue create \
+            --title "Manual rebase needed for ${{ steps.upstream.outputs.tag }}" \
+            --body "Applying patches/ onto ${{ steps.upstream.outputs.tag }} failed (see the failed *Track upstream releases* run). Rebase the patches manually, refresh the files in patches/, then tag ${{ steps.upstream.outputs.tag }}-deacon.1 and dispatch the *Build images* workflow with that tag."
