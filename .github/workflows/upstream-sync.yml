@@ -1,0 +1,80 @@
+name: Track upstream releases
+
+on:
+  schedule:
+    - cron: "0 14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  sync:
+    environment: Prod
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Find newest stable upstream release
+        id: upstream
+        run: |
+          git remote add upstream https://github.com/mastodon/mastodon.git
+          git fetch upstream --tags --quiet
+          latest=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -1)
+          if [ -z "$latest" ]; then
+            echo "No stable upstream tags found" >&2
+            exit 1
+          fi
+          if git rev-parse -q --verify "refs/tags/$latest-deacon.1" >/dev/null; then
+            echo "Already patched: $latest"
+          else
+            echo "New upstream release: $latest"
+            echo "tag=$latest" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Apply patches and tag
+        if: steps.upstream.outputs.tag
+        run: |
+          tag='${{ steps.upstream.outputs.tag }}'
+          git config user.name deacon-bot
+          git config user.email bot@deacon.social
+          fork_head=$(git rev-parse HEAD)
+          cp -r patches /tmp/patches
+          git checkout --detach "$tag"
+          git am --3way /tmp/patches/*.patch
+          # Swap upstream's workflow files for the fork's own, so the tag's
+          # tree carries this fork's build workflow (which its push triggers).
+          git rm -qr .github/workflows
+          git checkout "$fork_head" -- .github/workflows
+          git commit -qm "Replace upstream workflow files with fork workflows"
+          git tag "$tag-deacon.1"
+
+      - name: Push the tag with the deploy key
+        if: steps.upstream.outputs.tag
+        # GITHUB_TOKEN cannot push this tag: it would upload upstream's
+        # history, whose commits touch workflow files, which App tokens are
+        # never allowed to do. A write deploy key has no such restriction —
+        # and unlike GITHUB_TOKEN pushes, its pushes fire workflow triggers,
+        # so this tag push starts the image build by itself.
+        env:
+          DEPLOY_KEY: ${{ secrets.GH_DEPLOY_KEY }}
+        run: |
+          tag='${{ steps.upstream.outputs.tag }}'
+          mkdir -p "$HOME/.ssh"
+          printf '%s\n' "$DEPLOY_KEY" > "$HOME/.ssh/deploy_key"
+          chmod 600 "$HOME/.ssh/deploy_key"
+          ssh-keyscan github.com >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          GIT_SSH_COMMAND="ssh -i $HOME/.ssh/deploy_key" \
+            git push "git@github.com:${{ github.repository }}.git" "refs/tags/$tag-deacon.1"
+
+      - name: Open an issue if the patch no longer applies
+        if: failure() && steps.upstream.outputs.tag
+        run: |
+          gh issue create \
+            --title "Manual rebase needed for ${{ steps.upstream.outputs.tag }}" \
+            --body "Applying patches/ onto upstream ${{ steps.upstream.outputs.tag }} failed (see the failed *Track upstream releases* run). Rebase the patches manually, refresh the files in patches/ on the default branch, then either re-run this workflow or push the tag by hand following patches/README.md."
